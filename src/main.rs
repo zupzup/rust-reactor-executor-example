@@ -1,10 +1,23 @@
+use lazy_static::lazy_static;
+use rand::prelude::*;
 use std::collections::HashMap;
 use std::io;
 use std::io::prelude::*;
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::AsRawFd;
+use std::sync::mpsc::channel;
+use std::sync::Mutex;
 
+mod executor;
 mod poll;
+mod reactor;
+
+type EventId = usize;
+
+lazy_static! {
+    static ref EXECUTOR: Mutex<executor::Executor> = Mutex::new(executor::Executor::new());
+    static ref REACTOR: Mutex<reactor::Reactor> = Mutex::new(reactor::Reactor::new());
+}
 
 #[derive(Debug)]
 pub struct RequestContext {
@@ -22,7 +35,7 @@ impl RequestContext {
         }
     }
 
-    fn read_cb(&mut self, key: u64, poller: &poll::Poll) -> io::Result<()> {
+    fn read_cb(&mut self, event_id: EventId, poller: &poll::Poll) -> io::Result<()> {
         let mut buf = [0u8; 4096];
         match self.stream.read(&mut buf) {
             Ok(_) => {
@@ -38,9 +51,9 @@ impl RequestContext {
         self.buf.extend_from_slice(&buf);
         if self.buf.len() >= self.content_length {
             println!("got all data: {} bytes", self.buf.len());
-            poller.modify_interest(self.stream.as_raw_fd(), poll::listener_write_event(key))?;
+            poller.modify_interest(self.stream.as_raw_fd(), poll::write_event(event_id))?;
         } else {
-            poller.modify_interest(self.stream.as_raw_fd(), poll::listener_read_event(key))?;
+            poller.modify_interest(self.stream.as_raw_fd(), poll::read_event(event_id))?;
         }
         Ok(())
     }
@@ -62,10 +75,10 @@ impl RequestContext {
         }
     }
 
-    fn write_cb(&mut self, key: u64, poller: &poll::Poll) -> io::Result<()> {
+    fn write_cb(&mut self, event_id: EventId, poller: &poll::Poll) -> io::Result<()> {
         match self.stream.write(HTTP_RESP) {
-            Ok(_) => println!("answered from request {}", key),
-            Err(e) => eprintln!("could not answer to request {}, {}", key, e),
+            Ok(_) => println!("answered from request {}", event_id),
+            Err(e) => eprintln!("could not answer to request {}, {}", event_id, e),
         };
         self.stream.shutdown(std::net::Shutdown::Both)?;
         let fd = self.stream.as_raw_fd();
@@ -82,56 +95,107 @@ content-length: 5
 Hello"#;
 
 fn main() -> io::Result<()> {
-    let mut request_contexts: HashMap<u64, RequestContext> = HashMap::new();
-    let mut events: Vec<libc::epoll_event> = Vec::with_capacity(1024);
-    let mut key = 100;
-
+    let mut request_contexts: HashMap<EventId, RequestContext> = HashMap::new();
+    let listener_event_id = 100;
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
     let listener_fd = listener.as_raw_fd();
 
-    let poller = poll::Poll::new();
+    let (sender, receiver) = channel();
 
-    poller.add_interest(listener_fd, poll::listener_read_event(key))?;
-    loop {
-        println!("requests in flight: {}", request_contexts.len());
-        poller.poll(&mut events);
-        for ev in &events {
-            match ev.u64 {
-                100 => {
-                    match listener.accept() {
-                        Ok((stream, addr)) => {
-                            stream.set_nonblocking(true)?;
-                            println!("new client: {}", addr);
-                            key += 1;
-                            poller
-                                .add_interest(stream.as_raw_fd(), poll::listener_read_event(key))?;
-                            request_contexts.insert(key, RequestContext::new(stream));
-                        }
-                        Err(e) => eprintln!("couldn't accept: {}", e),
-                    };
-                    poller.modify_interest(listener_fd, poll::listener_read_event(100))?;
-                }
-                key => {
-                    let mut to_delete = None;
-                    if let Some(context) = request_contexts.get_mut(&key) {
-                        let events: u32 = ev.events;
-                        match events {
-                            v if v as i32 & libc::EPOLLIN == libc::EPOLLIN => {
-                                context.read_cb(key, &poller)?;
-                            }
-                            v if v as i32 & libc::EPOLLOUT == libc::EPOLLOUT => {
-                                context.write_cb(key, &poller)?;
-                                to_delete = Some(key);
-                            }
-                            v => println!("unexpected events: {}", v),
-                        };
-                    }
-                    if let Some(key) = to_delete {
-                        request_contexts.remove(&key);
-                    }
-                }
+    match REACTOR.lock() {
+        Ok(mut re) => re.run(sender),
+        Err(e) => panic!("error running reactor, {}", e),
+    };
+
+    REACTOR
+        .lock()
+        .expect("can get reactor lock")
+        .read_interest(listener_fd, listener_event_id)?;
+
+    let mut exec_lock = EXECUTOR.lock().expect("can get executor lock");
+    exec_lock.await_keep(listener_event_id, move |exec| {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                let event_id: EventId = random();
+                stream.set_nonblocking(true).expect("nonblocking works");
+                println!(
+                    "new client: {}, event_id: {}, raw fd: {}",
+                    addr,
+                    event_id,
+                    stream.as_raw_fd()
+                );
+                REACTOR
+                    .lock()
+                    .expect("can get reactor lock")
+                    .read_interest(stream.as_raw_fd(), event_id)
+                    .expect("can set read interest");
+                read_cb(exec, event_id, stream);
+                // request_contexts.insert(event_id, RequestContext::new(stream));
             }
-        }
+            Err(e) => eprintln!("couldn't accept: {}", e),
+        };
+        REACTOR
+            .lock()
+            .expect("can get reactor lock")
+            .read_interest(listener_fd, listener_event_id)
+            .expect("re-register works");
+    });
+    drop(exec_lock);
+
+    while let Ok(event_id) = receiver.recv() {
+        EXECUTOR
+            .lock()
+            .expect("can get an executor lock")
+            .run(event_id);
     }
+
+    Ok(())
+}
+
+fn read_cb(exec: &mut executor::Executor, event_id: EventId, mut stream: TcpStream) {
+    exec.await_once(event_id, move |write_exec| {
+        println!("in read event of stream with event id: {}", event_id);
+        // if let Some(context) = request_contexts.get_mut(&event_id) {
+        let mut buf = [0u8; 4096];
+        println!("reading...");
+        match stream.read(&mut buf) {
+            Ok(bytes) => {
+                println!("read done: {}, {:?}", bytes, std::str::from_utf8(&buf));
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+            Err(e) => {
+                eprintln!("error reading: {}", e);
+            }
+        };
+        println!("read done");
+        REACTOR
+            .lock()
+            .expect("can get reactor lock")
+            .write_interest(stream.as_raw_fd(), event_id)
+            .expect("can set write interest");
+        // }
+        write_cb(write_exec, event_id, stream);
+    });
+    println!("set read callback for client");
+}
+
+fn write_cb(exec: &mut executor::Executor, event_id: EventId, mut stream: TcpStream) {
+    exec.await_once(event_id, move |_| {
+        println!("in write event of stream with event id: {}", event_id);
+        match stream.write(HTTP_RESP) {
+            Ok(_) => println!("answered from request {}", event_id),
+            Err(e) => eprintln!("could not answer to request {}, {}", event_id, e),
+        };
+        stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("can close a stream");
+
+        REACTOR
+            .lock()
+            .expect("can get reactor lock")
+            .close(stream.as_raw_fd())
+            .expect("can close fd and clean up reactor");
+    });
+    println!("set write callback for client");
 }

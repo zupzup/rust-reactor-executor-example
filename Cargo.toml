@@ -6,3 +6,5 @@ edition = "2018"
 
 [dependencies]
 libc = "0.2"
+rand = { version = "0.7.3", default-features = false, features = ["std"] }
+lazy_static = "1.4"
