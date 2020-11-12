@@ -17,6 +17,7 @@ type EventId = usize;
 lazy_static! {
     static ref EXECUTOR: Mutex<executor::Executor> = Mutex::new(executor::Executor::new());
     static ref REACTOR: Mutex<reactor::Reactor> = Mutex::new(reactor::Reactor::new());
+    static ref CONTEXTS: Mutex<HashMap<EventId, RequestContext>> = Mutex::new(HashMap::new());
 }
 
 #[derive(Debug)]
@@ -35,7 +36,11 @@ impl RequestContext {
         }
     }
 
-    fn read_cb(&mut self, event_id: EventId, poller: &poll::Poll) -> io::Result<()> {
+    fn read_cb(
+        &mut self,
+        event_id: EventId,
+        write_exec: &mut executor::Executor,
+    ) -> io::Result<()> {
         let mut buf = [0u8; 4096];
         match self.stream.read(&mut buf) {
             Ok(_) => {
@@ -51,9 +56,14 @@ impl RequestContext {
         self.buf.extend_from_slice(&buf);
         if self.buf.len() >= self.content_length {
             println!("got all data: {} bytes", self.buf.len());
-            poller.modify_interest(self.stream.as_raw_fd(), poll::write_event(event_id))?;
+            REACTOR
+                .lock()
+                .expect("can get reactor lock")
+                .write_interest(self.stream.as_raw_fd(), event_id)
+                .expect("can set write interest");
+            write_cb(write_exec, event_id);
         } else {
-            poller.modify_interest(self.stream.as_raw_fd(), poll::read_event(event_id))?;
+            // poller.modify_interest(self.stream.as_raw_fd(), poll::read_event(event_id))?;
         }
         Ok(())
     }
@@ -75,15 +85,22 @@ impl RequestContext {
         }
     }
 
-    fn write_cb(&mut self, event_id: EventId, poller: &poll::Poll) -> io::Result<()> {
+    fn write_cb(&mut self, event_id: EventId) -> io::Result<()> {
+        println!("in write event of stream with event id: {}", event_id);
         match self.stream.write(HTTP_RESP) {
             Ok(_) => println!("answered from request {}", event_id),
             Err(e) => eprintln!("could not answer to request {}, {}", event_id, e),
         };
-        self.stream.shutdown(std::net::Shutdown::Both)?;
-        let fd = self.stream.as_raw_fd();
-        poller.remove_interest(fd)?;
-        poll::close(fd);
+        self.stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("can close a stream");
+
+        REACTOR
+            .lock()
+            .expect("can get reactor lock")
+            .close(self.stream.as_raw_fd())
+            .expect("can close fd and clean up reactor");
+
         Ok(())
     }
 }
@@ -95,7 +112,6 @@ content-length: 5
 Hello"#;
 
 fn main() -> io::Result<()> {
-    let mut request_contexts: HashMap<EventId, RequestContext> = HashMap::new();
     let listener_event_id = 100;
     let listener = TcpListener::bind("127.0.0.1:8000")?;
     listener.set_nonblocking(true)?;
@@ -130,8 +146,11 @@ fn main() -> io::Result<()> {
                     .expect("can get reactor lock")
                     .read_interest(stream.as_raw_fd(), event_id)
                     .expect("can set read interest");
-                read_cb(exec, event_id, stream);
-                // request_contexts.insert(event_id, RequestContext::new(stream));
+                CONTEXTS
+                    .lock()
+                    .expect("can lock request contests")
+                    .insert(event_id, RequestContext::new(stream));
+                read_cb(exec, event_id);
             }
             Err(e) => eprintln!("couldn't accept: {}", e),
         };
@@ -153,49 +172,33 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn read_cb(exec: &mut executor::Executor, event_id: EventId, mut stream: TcpStream) {
+fn read_cb(exec: &mut executor::Executor, event_id: EventId) {
     exec.await_once(event_id, move |write_exec| {
-        println!("in read event of stream with event id: {}", event_id);
-        // if let Some(context) = request_contexts.get_mut(&event_id) {
-        let mut buf = [0u8; 4096];
-        println!("reading...");
-        match stream.read(&mut buf) {
-            Ok(bytes) => {
-                println!("read done: {}, {:?}", bytes, std::str::from_utf8(&buf));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-            Err(e) => {
-                eprintln!("error reading: {}", e);
-            }
-        };
-        println!("read done");
-        REACTOR
+        if let Some(ctx) = CONTEXTS
             .lock()
-            .expect("can get reactor lock")
-            .write_interest(stream.as_raw_fd(), event_id)
-            .expect("can set write interest");
-        // }
-        write_cb(write_exec, event_id, stream);
+            .expect("can lock request_contexts")
+            .get_mut(&event_id)
+        {
+            ctx.read_cb(event_id, write_exec)
+                .expect("read callback works");
+        }
     });
     println!("set read callback for client");
 }
 
-fn write_cb(exec: &mut executor::Executor, event_id: EventId, mut stream: TcpStream) {
+fn write_cb(exec: &mut executor::Executor, event_id: EventId) {
     exec.await_once(event_id, move |_| {
-        println!("in write event of stream with event id: {}", event_id);
-        match stream.write(HTTP_RESP) {
-            Ok(_) => println!("answered from request {}", event_id),
-            Err(e) => eprintln!("could not answer to request {}, {}", event_id, e),
-        };
-        stream
-            .shutdown(std::net::Shutdown::Both)
-            .expect("can close a stream");
-
-        REACTOR
+        if let Some(ctx) = CONTEXTS
             .lock()
-            .expect("can get reactor lock")
-            .close(stream.as_raw_fd())
-            .expect("can close fd and clean up reactor");
+            .expect("can lock request_contexts")
+            .get_mut(&event_id)
+        {
+            ctx.write_cb(event_id).expect("write callback works");
+        }
+        CONTEXTS
+            .lock()
+            .expect("can lock request contexts")
+            .remove(&event_id);
     });
     println!("set write callback for client");
 }
