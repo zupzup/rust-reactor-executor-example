@@ -36,11 +36,7 @@ impl RequestContext {
         }
     }
 
-    fn read_cb(
-        &mut self,
-        event_id: EventId,
-        write_exec: &mut executor::Executor,
-    ) -> io::Result<()> {
+    fn read_cb(&mut self, event_id: EventId, exec: &mut executor::Executor) -> io::Result<()> {
         let mut buf = [0u8; 4096];
         match self.stream.read(&mut buf) {
             Ok(_) => {
@@ -61,9 +57,15 @@ impl RequestContext {
                 .expect("can get reactor lock")
                 .write_interest(self.stream.as_raw_fd(), event_id)
                 .expect("can set write interest");
-            write_cb(write_exec, event_id);
+            write_cb(exec, event_id);
         } else {
-            // poller.modify_interest(self.stream.as_raw_fd(), poll::read_event(event_id))?;
+            println!("still waiting for data: {} bytes", self.buf.len());
+            REACTOR
+                .lock()
+                .expect("can get reactor lock")
+                .read_interest(self.stream.as_raw_fd(), event_id)
+                .expect("can set write interest");
+            read_cb(exec, event_id);
         }
         Ok(())
     }

@@ -49,36 +49,6 @@ impl Poll {
         // safe  as long as the kernel does nothing wrong - copied from mio
         unsafe { events.set_len(res as usize) };
     }
-
-    pub fn add_interest(&self, fd: RawFd, mut event: libc::epoll_event) -> io::Result<()> {
-        syscall!(epoll_ctl(
-            self.epoll_fd,
-            libc::EPOLL_CTL_ADD,
-            fd,
-            &mut event
-        ))?;
-        Ok(())
-    }
-
-    pub fn modify_interest(&self, fd: RawFd, mut event: libc::epoll_event) -> io::Result<()> {
-        syscall!(epoll_ctl(
-            self.epoll_fd,
-            libc::EPOLL_CTL_MOD,
-            fd,
-            &mut event
-        ))?;
-        Ok(())
-    }
-
-    pub fn remove_interest(&self, fd: RawFd) -> io::Result<()> {
-        syscall!(epoll_ctl(
-            self.epoll_fd,
-            libc::EPOLL_CTL_DEL,
-            fd,
-            std::ptr::null_mut()
-        ))?;
-        Ok(())
-    }
 }
 
 pub fn read_event(event_id: EventId) -> libc::epoll_event {
