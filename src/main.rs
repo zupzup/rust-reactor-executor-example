@@ -51,15 +51,14 @@ impl RequestContext {
         };
         self.buf.extend_from_slice(&buf);
         if self.buf.len() >= self.content_length {
-            println!("got all data: {} bytes", self.buf.len());
             REACTOR
                 .lock()
                 .expect("can get reactor lock")
                 .write_interest(self.stream.as_raw_fd(), event_id)
                 .expect("can set write interest");
+
             write_cb(exec, event_id);
         } else {
-            println!("still waiting for data: {} bytes", self.buf.len());
             REACTOR
                 .lock()
                 .expect("can get reactor lock")
@@ -131,8 +130,21 @@ fn main() -> io::Result<()> {
         .expect("can get reactor lock")
         .read_interest(listener_fd, listener_event_id)?;
 
+    listener_cb(listener, listener_event_id);
+
+    while let Ok(event_id) = receiver.recv() {
+        EXECUTOR
+            .lock()
+            .expect("can get an executor lock")
+            .run(event_id);
+    }
+
+    Ok(())
+}
+
+fn listener_cb(listener: TcpListener, event_id: EventId) {
     let mut exec_lock = EXECUTOR.lock().expect("can get executor lock");
-    exec_lock.await_keep(listener_event_id, move |exec| {
+    exec_lock.await_keep(event_id, move |exec| {
         match listener.accept() {
             Ok((stream, addr)) => {
                 let event_id: EventId = random();
@@ -159,19 +171,10 @@ fn main() -> io::Result<()> {
         REACTOR
             .lock()
             .expect("can get reactor lock")
-            .read_interest(listener_fd, listener_event_id)
+            .read_interest(listener.as_raw_fd(), event_id)
             .expect("re-register works");
     });
     drop(exec_lock);
-
-    while let Ok(event_id) = receiver.recv() {
-        EXECUTOR
-            .lock()
-            .expect("can get an executor lock")
-            .run(event_id);
-    }
-
-    Ok(())
 }
 
 fn read_cb(exec: &mut executor::Executor, event_id: EventId) {
@@ -185,7 +188,6 @@ fn read_cb(exec: &mut executor::Executor, event_id: EventId) {
                 .expect("read callback works");
         }
     });
-    println!("set read callback for client");
 }
 
 fn write_cb(exec: &mut executor::Executor, event_id: EventId) {
@@ -202,5 +204,4 @@ fn write_cb(exec: &mut executor::Executor, event_id: EventId) {
             .expect("can lock request contexts")
             .remove(&event_id);
     });
-    println!("set write callback for client");
 }

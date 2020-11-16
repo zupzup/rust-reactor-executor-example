@@ -35,7 +35,6 @@ impl Reactor {
     }
 
     pub fn read_interest(&mut self, fd: RawFd, event_id: EventId) -> io::Result<()> {
-        println!("setting read interest for {}", event_id);
         self.registry
             .as_mut()
             .expect("registry is set")
@@ -43,7 +42,6 @@ impl Reactor {
     }
 
     pub fn write_interest(&mut self, fd: RawFd, event_id: EventId) -> io::Result<()> {
-        println!("setting write interest for {}", event_id);
         self.registry
             .as_mut()
             .expect("registry is set")
